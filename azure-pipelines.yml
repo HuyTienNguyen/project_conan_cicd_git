@@ -1,0 +1,242 @@
+# Starter pipeline
+# Start with a minimal pipeline that you can customize to build and deploy your code.
+# Add steps that build, run tests, deploy, and more:
+# https://aka.ms/yaml
+#
+
+trigger:
+  branches:
+    include:
+    - main
+    - releases/*
+pr:
+  - main
+  - releases/*
+
+pool:
+  vmImage: ubuntu-latest
+
+resources:
+  containers:
+    - container: ubuntu18.04-gcc11-conan2-doxygen1.9.6
+      image: mattgomes28/cpp-ubuntu-bionic:0.13
+      options: --user 0:0
+
+stages:
+
+- stage: failfast
+  displayName: FailFast Checks
+  jobs:
+  - job: failfast
+    displayName: Failfast Scripts
+    container: ubuntu18.04-gcc11-conan2-doxygen1.9.6
+    continueOnError: false
+    steps:
+    - bash: scripts/shellcheck.sh
+      displayName: Linting Shell
+      workingDirectory: $(Build.SourcesDirectory)
+    - bash: scripts/cpp-lint.sh
+      displayName: Linting CPP files
+      workingDirectory: $(Build.SourcesDirectory)
+
+- stage: 'build'
+  displayName: 'Build Project'
+  dependsOn:
+    - failfast
+
+  jobs:
+  - template: scripts/pipeline/ubuntu_build.yml
+    parameters:
+      jobName: ubuntu_build_x86_64_debug
+      buildType: Debug
+      cmakePreset: unix-deb
+      cmakeExtraArgs: -DBUILD_DOCS="On"
+      containerName: ubuntu18.04-gcc11-conan2-doxygen1.9.6
+      artifactName: UbuntuDebugBuild
+
+  - template: scripts/pipeline/ubuntu_build.yml
+    parameters:
+      jobName: ubuntu_build_x86_64_clang_debug
+      buildType: Debug
+      cmakePreset: unix-deb-ninja
+      containerName: ubuntu18.04-gcc11-conan2-doxygen1.9.6
+      artifactName: UbuntuClangDebugBuild
+      compiler: clang
+      compilerStd: 20
+      compilerLibCxx: libstdc++11
+      compilerVersion: 17
+
+  - template: scripts/pipeline/ubuntu_build.yml
+    parameters:
+      jobName: ubuntu_build_x86_64_release
+      buildType: Release
+      cmakePreset: unix-rel
+      containerName: ubuntu18.04-gcc11-conan2-doxygen1.9.6
+      artifactName: UbuntuReleaseBuild
+
+  - template: scripts/pipeline/ubuntu_build.yml
+    parameters:
+      jobName: ubuntu_build_x86_64_clang_release
+      buildType: Release
+      cmakePreset: unix-rel-ninja
+      containerName: ubuntu18.04-gcc11-conan2-doxygen1.9.6
+      artifactName: UbuntuClangReleaseBuild
+      compiler: clang
+      compilerStd: 20
+      compilerLibCxx: libstdc++11
+      compilerVersion: 17
+
+  - template: scripts/pipeline/ubuntu_build.yml
+    parameters:
+      jobName: ubuntu_build_x86_64_release_shared
+      buildType: Release
+      cmakePreset: unix-rel-shared
+      containerName: ubuntu18.04-gcc11-conan2-doxygen1.9.6
+      artifactName: UbuntuSharedReleaseBuild
+  
+  - template: scripts/pipeline/ubuntu_build.yml
+    parameters:
+      jobName: ubuntu_build_x86_64_debug_shared
+      buildType: Debug
+      cmakePreset: unix-deb-shared
+      containerName: ubuntu18.04-gcc11-conan2-doxygen1.9.6
+      artifactName: UbuntuSharedDebugBuild
+
+  - template: scripts/pipeline/windows_build.yml
+    parameters:
+      jobName: windows_build_x64_debug
+      buildType: Debug
+      cmakePreset: vs2022-deb
+      artifactName: WindowsDebugBuild
+
+  - template: scripts/pipeline/windows_build.yml
+    parameters:
+      jobName: windows_build_x64_release
+      buildType: Release
+      cmakePreset: vs2022-rel
+      artifactName: WindowsReleaseBuild
+
+  - template: scripts/pipeline/windows_build.yml
+    parameters:
+      jobName: windows_build_x64_debug_shared
+      buildType: Debug
+      cmakePreset: vs2022-deb-shared
+      artifactName: WindowsDebugSharedBuild
+
+  - template: scripts/pipeline/windows_build.yml
+    parameters:
+      jobName: windows_build_x64_release_shared
+      buildType: Release
+      cmakePreset: vs2022-rel-shared
+      artifactName: WindowsReleaseSharedBuild
+
+- stage: docs
+  displayName: Build Documentation
+  dependsOn:
+    - build
+  jobs:
+  - job:
+    container: ubuntu18.04-gcc11-conan2-doxygen1.9.6
+    displayName: Build Doxygen CMake
+    steps:
+      - checkout: self
+        submodules: recursive
+      - bash: scripts/helpers/conan-install.sh
+        displayName: Installing all Conan dependencies
+        workingDirectory: $(Build.SourcesDirectory)
+
+      - template: scripts/pipeline/download_build.yml
+        parameters:
+          artifactName: UbuntuDebugBuild
+          destination: $(Build.SourcesDirectory)/build
+
+      - bash: |
+          set -euo pipefail
+          cd "build/unix-deb" && cmake --build . --target=doxygen_build
+        displayName: Building The Doxygen Target
+        workingDirectory: $(Build.SourcesDirectory)
+      
+      - task: PublishPipelineArtifact@1
+        inputs:
+          targetPath: $(Build.SourcesDirectory)/build/unix-deb/docs
+          artifactName: 'DocsFiles'
+
+- stage: tests
+  displayName: Running Tests
+  dependsOn:
+    - build
+  jobs:
+  - job:
+    container: ubuntu18.04-gcc11-conan2-doxygen1.9.6
+    displayName: Ubuntu Tests
+    steps:
+      - template: scripts/pipeline/download_build.yml
+        parameters:
+          artifactName: UbuntuDebugBuild
+          destination: $(Build.SourcesDirectory)/build
+
+      - bash: |
+          set -euo pipefail
+          cd "build/unix-deb" && ctest --verbose --test-dir="build/unix-deb"
+        displayName: Running All Tests
+        workingDirectory: $(Build.SourcesDirectory)
+
+      - bash: |
+          set -euo pipefail
+          ./scripts/gather_cov.sh
+        displayName: Generating Coverage Stats
+
+      - task: PublishPipelineArtifact@1
+        displayName: Upload Coverage Artifacts
+        condition: always()
+        inputs:
+          targetPath: $(Build.SourcesDirectory)/coverage
+          artifactName: Coverage
+
+      - bash: |
+          set -euo pipefail
+          bash <(curl -s https://codecov.io/bash) -f coverage.info
+        displayName: Upload To CodeCov
+        env:
+          CODECOV_TOKEN: $(CodeCovToken)
+        workingDirectory: $(Build.SourcesDirectory)
+  - job:
+    pool:
+      vmImage: windows-2022
+    displayName: Windows Tests
+    steps:
+      - checkout: none
+
+      - task: DownloadPipelineArtifact@2
+        inputs:
+          targetPath: $(Build.SourcesDirectory)/build
+          artifactName: WindowsDebugBuild
+
+      - pwsh: |
+          cd "build/vs2022-deb"
+          ctest --verbose --test-dir="build/vs2022-deb" -C Debug
+        displayName: Running All Tests
+        workingDirectory: $(Build.SourcesDirectory)
+        failOnStderr: true
+
+- stage: static_analysis
+  displayName: Static Analysis
+  dependsOn:
+    - build
+  jobs:
+  - job:
+    container: ubuntu18.04-gcc11-conan2-doxygen1.9.6
+    displayName: Running Clang-Tidy
+    steps:
+      - checkout: self
+      
+      - bash: scripts/helpers/conan-install.sh
+        displayName: Installing all Conan dependencies
+        workingDirectory: $(Build.SourcesDirectory)
+
+      - bash: |
+          set -euo pipefail
+          cmake --preset "unix-deb" -DCMAKE_EXPORT_COMPILE_COMMANDS=On
+          ./scripts/static-analysis.sh
+        displayName: Running Clang-Tidy script
+        workingDirectory: $(Build.SourcesDirectory)
